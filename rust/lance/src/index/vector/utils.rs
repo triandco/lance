@@ -7,6 +7,7 @@ use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
+use lance_arrow::FixedSizeListArrayExt;
 use snafu::{location, Location};
 
 use crate::dataset::Dataset;
@@ -56,12 +57,19 @@ pub async fn maybe_sample_training_data(
         concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
-    Ok(array.as_fixed_size_list().clone())
+    batch
+        .column_by_name(column)
+        .ok_or(Error::Index {
+            message: format!(
+                "Sample training data: column {} does not exist in return",
+                column
+            ),
+            location: location!(),
+        })?
+        .as_fixed_size_list()
+        .clone()
+        .convert_to_floating_point()
+        .map_err(|e| lance_core::Error::Arrow { 
+            message: e.to_string(), location: location!() 
+        })
 }
