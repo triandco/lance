@@ -322,6 +322,25 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                             .nulls()
                             .map(|x| x.clone()))
                     ),
+                    DataType::UInt8 => Ok(
+                        FixedSizeListArray::new(
+                            Arc::new(arrow_schema::Field::new(
+                                field.name(), 
+                                DataType::Float64, 
+                                field.is_nullable())),
+                            *size, 
+                            Arc::new(Float64Array::from_iter_values(
+                                self
+                                .values()
+                                .as_any()
+                                .downcast_ref::<UInt8Array>()
+                                .ok_or(ArrowError::ParseError(format!("Fail to cast primitive array to Int8Type")))?
+                                .into_iter()
+                                .filter_map(|x| x.map(|y| y as f64)))), 
+                            self
+                            .nulls()
+                            .map(|x| x.clone()))
+                    ),
                     DataType::UInt32 => Ok(
                         FixedSizeListArray::new(
                             Arc::new(arrow_schema::Field::new(
