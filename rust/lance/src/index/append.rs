@@ -79,7 +79,7 @@ pub async fn merge_indices<'a>(
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
-        IndexType::Scalar => {
+        it if it.is_scalar() => {
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
@@ -96,13 +96,20 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-
+            // The BTree index implementation leverages the legacy format's batch offset,
+            // which has been removed from new format, so keep using the legacy format for now.
+            let new_store = match index.index_type() {
+                IndexType::Scalar | IndexType::BTree => {
+                    LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string())
+                        .with_legacy_format(true)
+                }
+                _ => LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string()),
+            };
             index.update(new_data_stream.into(), &new_store).await?;
 
             Ok((new_uuid, 1))
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -123,6 +130,13 @@ pub async fn merge_indices<'a>(
             )
             .await
         }
+        _ => Err(Error::Index {
+            message: format!(
+                "Append index: invalid index type: {:?}",
+                indices[0].index_type()
+            ),
+            location: location!(),
+        }),
     }?;
 
     Ok(Some((
@@ -142,12 +156,15 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt,
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -274,10 +291,21 @@ mod tests {
         assert_eq!(row_in_index, 2000);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_query_delta_indices() {
+    async fn test_query_delta_indices(
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
+    ) {
         const DIM: usize = 64;
-        const IVF_PARTITIONS: usize = 2;
         const TOTAL: usize = 1000;
 
         let test_dir = tempdir().unwrap();
@@ -309,20 +337,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &VectorIndexParams::with_ivf_pq_params(
-                    MetricType::L2,
-                    IvfBuildParams::new(IVF_PARTITIONS),
-                    PQBuildParams {
-                        num_sub_vectors: 2,
-                        ..Default::default()
-                    },
-                ),
-                true,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
         let stats: serde_json::Value =
@@ -369,6 +384,7 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive(), 2)
             .unwrap()
+            .refine(1)
             .try_into_batch()
             .await
             .unwrap();

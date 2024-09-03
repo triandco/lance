@@ -46,7 +46,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-    aws_credential_types::cache::CredentialsCache,
     aws_credential_types::provider::error::CredentialsError,
     aws_credential_types::provider::ProvideCredentials,
     lance_io::object_store::{build_aws_credential, StorageOptions},
@@ -58,13 +57,12 @@ use {
 
 use crate::format::{Index, Manifest};
 
-const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
-    object_store: &'a dyn OSObjectStore,
+    object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
@@ -74,10 +72,6 @@ pub type ManifestWriter = for<'a> fn(
 pub fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
-}
-
-pub fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
 }
 
 #[derive(Debug)]
@@ -227,21 +221,6 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     })
 }
 
-async fn write_latest_manifest(
-    from_path: &Path,
-    base_path: &Path,
-    object_store: &dyn OSObjectStore,
-) -> Result<()> {
-    let latest_path = latest_manifest_path(base_path);
-    let staging_path = make_staging_manifest_path(from_path)?;
-    object_store
-        .copy(from_path, &staging_path)
-        .await
-        .map_err(|err| CommitError::OtherError(err.into()))?;
-    object_store.rename(&staging_path, &latest_path).await?;
-    Ok(())
-}
-
 #[cfg(feature = "dynamodb")]
 const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 
@@ -312,7 +291,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn OSObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError>;
 }
@@ -362,13 +341,17 @@ async fn build_dynamodb_external_store(
     app_name: &str,
 ) -> Result<Arc<dyn ExternalManifestStore>> {
     use super::commit::dynamodb::DynamoDBExternalManifestStore;
-    use aws_sdk_dynamodb::{config::Region, Client};
+    use aws_sdk_dynamodb::{
+        config::{IdentityCache, Region},
+        Client,
+    };
 
     let mut dynamodb_config = aws_sdk_dynamodb::config::Builder::new()
+        .behavior_version_latest()
         .region(Some(Region::new(region.to_string())))
         .credentials_provider(OSObjectStoreToAwsCredAdaptor(creds))
         // caching should be handled by passed AwsCredentialProvider
-        .credentials_cache(CredentialsCache::no_caching());
+        .identity_cache(IdentityCache::no_cache());
 
     if let Some(endpoint) = endpoint {
         dynamodb_config = dynamodb_config.endpoint_url(endpoint);
@@ -462,13 +445,7 @@ pub async fn commit_handler_from_url(
             }))
         }
         "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
-
-        unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
-            });
-            Err(err)
-        }
+        _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }
 
@@ -523,7 +500,7 @@ impl CommitHandler for UnsafeCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn OSObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // Log a one-time warning
@@ -536,12 +513,10 @@ impl CommitHandler for UnsafeCommitHandler {
         }
 
         let version_path = self
-            .resolve_version(base_path, manifest.version, object_store)
+            .resolve_version(base_path, manifest.version, &object_store.inner)
             .await?;
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
-
-        write_latest_manifest(&version_path, base_path, object_store).await?;
 
         Ok(())
     }
@@ -586,18 +561,18 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn OSObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         let path = self
-            .resolve_version(base_path, manifest.version, object_store)
+            .resolve_version(base_path, manifest.version, &object_store.inner)
             .await?;
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
         let lease = self.lock(manifest.version).await?;
 
         // Head the location and make sure it's not already committed
-        match object_store.head(&path).await {
+        match object_store.inner.head(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
                 // Release the lock
@@ -616,8 +591,6 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         }
         let res = manifest_writer(object_store, manifest, indices, &path).await;
 
-        write_latest_manifest(&path, base_path, object_store).await?;
-
         // Release the lock
         lease.release(res.is_ok()).await?;
 
@@ -632,7 +605,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn OSObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         self.as_ref()
@@ -653,14 +626,14 @@ impl CommitHandler for RenameCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<Index>>,
         base_path: &Path,
-        object_store: &dyn OSObjectStore,
+        object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
     ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
         let path = self
-            .resolve_version(base_path, manifest.version, object_store)
+            .resolve_version(base_path, manifest.version, &object_store.inner)
             .await?;
 
         // Add .tmp_ prefix to the path
@@ -678,7 +651,11 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        let res = match object_store.rename_if_not_exists(&tmp_path, &path).await {
+        match object_store
+            .inner
+            .rename_if_not_exists(&tmp_path, &path)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed
@@ -691,11 +668,7 @@ impl CommitHandler for RenameCommitHandler {
                 // Something else went wrong
                 return Err(CommitError::OtherError(e.into()));
             }
-        };
-
-        write_latest_manifest(&path, base_path, object_store).await?;
-
-        res
+        }
     }
 }
 
@@ -713,6 +686,6 @@ pub struct CommitConfig {
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self { num_retries: 5 }
+        Self { num_retries: 20 }
     }
 }

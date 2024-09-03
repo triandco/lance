@@ -4,12 +4,12 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, ArrayRef};
-use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
+    data::DataBlock,
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -37,13 +37,13 @@ impl FixedListScheduler {
 impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
-            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .map(|range| (range.start * self.dimension as u64)..(range.end * self.dimension as u64))
             .collect::<Vec<_>>();
         trace!(
             "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
@@ -61,7 +61,7 @@ impl PageScheduler for FixedListScheduler {
             let items_decoder = inner_page_decoder.await?;
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
-                dimension,
+                dimension: dimension as u64,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -70,23 +70,18 @@ impl PageScheduler for FixedListScheduler {
 
 pub struct FixedListDecoder {
     items_decoder: Box<dyn PrimitivePageDecoder>,
-    dimension: u32,
+    dimension: u64,
 }
 
 impl PrimitivePageDecoder for FixedListDecoder {
-    fn decode(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        all_null: &mut bool,
-    ) -> Result<Vec<BytesMut>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder.decode(rows_to_skip, num_rows, all_null)
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers()
+        let num_child_rows = num_rows * self.dimension;
+        let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
+        let mut child_data = child_data.as_fixed_width()?;
+        child_data.num_values = num_rows;
+        child_data.bits_per_value *= self.dimension;
+        Ok(DataBlock::FixedWidth(child_data))
     }
 }
 
@@ -128,7 +123,7 @@ impl ArrayEncoder for FslEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field};
 
@@ -142,7 +137,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 }

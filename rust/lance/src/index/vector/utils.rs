@@ -9,6 +9,7 @@ use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 use snafu::{location, Location};
+use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
@@ -72,4 +73,25 @@ pub async fn maybe_sample_training_data(
         .map_err(|e| lance_core::Error::Arrow { 
             message: e.to_string(), location: location!() 
         })
+}
+
+#[derive(Debug)]
+pub struct PartitionLoadLock {
+    partition_locks: Vec<Arc<Mutex<()>>>,
+}
+
+impl PartitionLoadLock {
+    pub fn new(num_partitions: usize) -> Self {
+        Self {
+            partition_locks: (0..num_partitions)
+                .map(|_| Arc::new(Mutex::new(())))
+                .collect(),
+        }
+    }
+
+    pub fn get_partition_mutex(&self, partition_id: usize) -> Arc<Mutex<()>> {
+        let mtx = &self.partition_locks[partition_id];
+
+        mtx.clone()
+    }
 }

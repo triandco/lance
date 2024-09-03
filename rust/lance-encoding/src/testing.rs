@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
+use arrow::array::make_comparator;
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
@@ -12,21 +13,25 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::Result;
-use lance_datagen::{array, gen, RowCount, Seed};
+use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
     decoder::{
-        BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMessage,
-        DecoderMiddlewareChain, FilterExpression, PageInfo,
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
+        DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodedBuffer, EncodedPage, FieldEncoder,
-        FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
+    version::LanceFileVersion,
     EncodingsIo,
 };
 
+const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
     data: Bytes,
 }
@@ -35,30 +40,41 @@ impl SimulatedScheduler {
     pub fn new(data: Bytes) -> Self {
         Self { data }
     }
-
-    fn satisfy_request(&self, req: Range<u64>) -> Bytes {
-        self.data.slice(req.start as usize..req.end as usize)
-    }
 }
 
 impl EncodingsIo for SimulatedScheduler {
     fn submit_request(
         &self,
         ranges: Vec<Range<u64>>,
-        _priority: u64,
+        priority: u64,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        std::future::ready(Ok(ranges
+        let data = ranges
             .into_iter()
-            .map(|range| self.satisfy_request(range))
-            .collect::<Vec<_>>()))
-        .boxed()
+            .map(|range| {
+                if range.is_empty() {
+                    // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
+                    panic!("Empty request")
+                }
+                self.data.slice(range.start as usize..range.end as usize)
+            })
+            .collect();
+
+        log::trace!("Scheduled request with priority {}", priority);
+        std::future::ready(data)
+            .map(move |data| {
+                log::trace!("Decoded request with priority {}", priority);
+                Ok(data)
+            })
+            .boxed()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
     batch_size: u32,
     schema: &Schema,
+    column_indices: &[u32],
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
     io: &Arc<dyn EncodingsIo>,
@@ -68,15 +84,19 @@ async fn test_decode(
     ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
+    let decode_and_validate =
+        DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
+            validate_data: true,
+        }));
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
+        column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
-        &DecoderMiddlewareChain::default(),
+        &decode_and_validate,
         io,
     )
-    .await
     .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -95,33 +115,104 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
-            assert_eq!(&expected, actual);
+            if &expected != actual {
+                if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
+                {
+                    // We can't just assert_eq! because the error message is not very helpful.  This gives us a bit
+                    // more information about where the mismatch is.
+                    for i in 0..expected.len() {
+                        if !matches!(comparator(i, i), Ordering::Equal) {
+                            panic!(
+                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            i,
+                            expected,
+                            actual,
+                            expected.slice(i, 1),
+                            actual.slice(i, 1)
+                        );
+                        }
+                    }
+                } else {
+                    // Some arrays (like the null type) don't have a comparator so we just re-run the normal comparison
+                    // and let it assert
+                    assert_eq!(&expected, actual);
+                }
+            }
         }
         offset += batch_size as usize;
     }
 }
 
+pub trait ArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator>;
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider>;
+}
+struct RandomArrayGeneratorProvider {
+    field: Field,
+}
+
+impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
+    fn provide(&self) -> Box<dyn ArrayGenerator> {
+        array::rand_type(self.field.data_type())
+    }
+
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+        Box::new(Self {
+            field: self.field.clone(),
+        })
+    }
+}
+
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field) {
+pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
+    let field = field.with_metadata(metadata);
+    let array_generator_provider = RandomArrayGeneratorProvider {
+        field: field.clone(),
+    };
+    check_round_trip_encoding_generated(
+        field,
+        Box::new(array_generator_provider),
+        LanceFileVersion::default_v2(),
+    )
+    .await;
+}
+
+pub async fn check_round_trip_encoding_generated(
+    field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+    version: LanceFileVersion,
+) {
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoding_config = HashMap::new();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
+            version,
+        };
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
+            let encoding_options = EncodingOptions {
+                max_page_bytes: MAX_PAGE_BYTES,
+                cache_bytes_per_column: page_size,
+                keep_original_array: true,
+            };
             encoding_strategy
                 .create_field_encoder(
                     &encoding_strategy,
                     &lance_field,
                     &mut column_index_seq,
-                    page_size,
-                    true,
-                    &encoding_config,
+                    &encoding_options,
                 )
                 .unwrap()
         };
-        check_round_trip_field_encoding_random(encoder_factory, field.clone()).await
+
+        // let array_generator_provider = RandomArrayGeneratorProvider{field: field.clone()};
+        check_round_trip_field_encoding_random(
+            encoder_factory,
+            field.clone(),
+            array_generator_provider.copy(),
+        )
+        .await
     }
 }
 
@@ -138,6 +229,7 @@ pub struct TestCases {
     indices: Vec<Vec<u64>>,
     batch_size: u32,
     skip_validation: bool,
+    max_page_size: Option<u64>,
 }
 
 impl Default for TestCases {
@@ -147,6 +239,7 @@ impl Default for TestCases {
             ranges: Vec::new(),
             indices: Vec::new(),
             skip_validation: false,
+            max_page_size: None,
         }
     }
 }
@@ -171,6 +264,15 @@ impl TestCases {
         self.skip_validation = true;
         self
     }
+
+    pub fn with_max_page_size(mut self, max_page_size: u64) -> Self {
+        self.max_page_size = Some(max_page_size);
+        self
+    }
+
+    fn get_max_page_size(&self) -> u64 {
+        self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
+    }
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -179,22 +281,29 @@ impl TestCases {
 /// In other words, these are multiple chunks of one long array and not multiple columns
 /// in a record batch.  To feed a "record batch" you should first convert the record batch
 /// to a struct array.
-pub async fn check_round_trip_encoding_of_data(data: Vec<Arc<dyn Array>>, test_cases: &TestCases) {
+pub async fn check_round_trip_encoding_of_data(
+    data: Vec<Arc<dyn Array>>,
+    test_cases: &TestCases,
+    metadata: HashMap<String, String>,
+) {
     let example_data = data.first().expect("Data must have at least one array");
-    let field = Field::new("", example_data.data_type().clone(), true);
+    let mut field = Field::new("", example_data.data_type().clone(), true);
+    field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         let encoding_strategy = CoreFieldEncodingStrategy::default();
-        let encoding_config = HashMap::new();
         let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: page_size,
+            max_page_bytes: test_cases.get_max_page_size(),
+            keep_original_array: true,
+        };
         let encoder = encoding_strategy
             .create_field_encoder(
                 &encoding_strategy,
                 &lance_field,
                 &mut column_index_seq,
-                page_size,
-                true,
-                &encoding_config,
+                &encoding_options,
             )
             .unwrap();
         check_round_trip_encoding_inner(encoder, &field, data.clone(), test_cases).await
@@ -300,13 +409,13 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    // We always try a full decode, regardless of the test cases provided
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
         test_cases.batch_size,
         &schema,
+        &[0],
         &column_infos,
         concat_data.clone(),
         &scheduler_copy.clone(),
@@ -342,6 +451,7 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),
@@ -388,6 +498,7 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
+            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),
@@ -418,9 +529,14 @@ const NUM_RANDOM_ROWS: u32 = 10000;
 async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
+    array_generator_provider: Box<dyn ArrayGeneratorProvider>,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
+            if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
+                continue;
+            }
+
             let field = if null_rate.is_some() {
                 if !supports_nulls(field.data_type()) {
                     continue;
@@ -452,9 +568,13 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().anon_col(array::rand_type(field.data_type()));
+                    let mut generator = gen().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
-                        generator.with_random_nulls(null_rate);
+                        // The null generator is the only generator that already inserts nulls
+                        // and attempting to do so again makes arrow-rs grumpy
+                        if !matches!(field.data_type(), DataType::Null) {
+                            generator.with_random_nulls(null_rate);
+                        }
                     }
                     let all_data = generator
                         .into_batch_rows(RowCount::from(10000))
@@ -470,9 +590,13 @@ async fn check_round_trip_field_encoding_random(
                     for i in 0..num_ingest_batches {
                         let mut generator = gen()
                             .with_seed(Seed::from(i as u64))
-                            .anon_col(array::rand_type(field.data_type()));
+                            .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {
-                            generator.with_random_nulls(null_rate);
+                            // The null generator is the only generator that already inserts nulls
+                            // and attempting to do so again makes arrow-rs grumpy
+                            if !matches!(field.data_type(), DataType::Null) {
+                                generator.with_random_nulls(null_rate);
+                            }
                         }
                         let arr = generator
                             .into_batch_rows(RowCount::from(rows_per_batch as u64))

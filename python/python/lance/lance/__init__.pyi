@@ -37,12 +37,15 @@ class LanceFileWriter:
     def __init__(
         self,
         path: str,
-        schema: pa.Schema,
-        data_cache_bytes: int,
-        keep_original_array: bool,
+        schema: Optional[pa.Schema],
+        data_cache_bytes: Optional[int],
+        version: Optional[str],
+        keep_original_array: Optional[bool],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
     def finish(self) -> int: ...
+    def add_schema_metadata(self, key: str, value: str) -> None: ...
+    def add_global_buffer(self, data: bytes) -> int: ...
 
 class LanceFileReader:
     def __init__(self, path: str): ...
@@ -55,6 +58,7 @@ class LanceFileReader:
     def take_rows(
         self, indices: List[int], batch_size: int, batch_readahead: int
     ) -> pa.RecordBatchReader: ...
+    def read_global_buffer(self, index: int) -> bytes: ...
 
 class LanceBufferDescriptor:
     position: int
